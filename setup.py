@@ -14,7 +14,7 @@ PACKAGE_DIR = 'src'
 
 setup(
     name=PACKAGE_NAME,
-    version='0.2.7',
+    version='0.2.9',
     author='Samuel Hoffstaetter',
     author_email='samuel@hoffstaetter.com',
     maintainer='Matthias Lee',
@@ -35,7 +35,11 @@ setup(
     },
     classifiers=[
         'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
         'Programming Language :: Python :: 2.7',
         'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ]
 )

@@ -10,23 +10,30 @@ except ImportError:
     import Image
 
 import os
-import sys
-import subprocess
-import tempfile
 import shlex
 import string
-from glob import iglob
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
 from csv import QUOTE_NONE
-from functools import wraps
-from pkgutil import find_loader
 from distutils.version import LooseVersion
-from os.path import realpath, normpath, normcase
+from functools import wraps
+from glob import iglob
+from io import BytesIO
+from os.path import normcase, normpath, realpath
+from pkgutil import find_loader
+from threading import Timer
+
+try:
+    from PIL import Image
+except ImportError:
+    import Image
 
 numpy_installed = find_loader('numpy') is not None
 if numpy_installed:
     from numpy import ndarray
 
-from io import BytesIO
 pandas_installed = find_loader('pandas') is not None
 if pandas_installed:
     import pandas as pd
@@ -34,6 +41,10 @@ if pandas_installed:
 # CHANGE THIS IF TESSERACT IS NOT IN YOUR PATH, OR IS NAMED DIFFERENTLY
 tesseract_cmd = 'tesseract'
 RGB_MODE = 'RGB'
+SUPPORTED_FORMATS = {
+    'JPEG', 'PNG', 'PBM', 'PGM', 'PPM', 'TIFF', 'BMP', 'GIF'
+}
+
 OSD_KEYS = {
     'Page number': ('page_num', int),
     'Orientation in degrees': ('orientation', int),
@@ -78,6 +89,34 @@ class TSVNotSupported(EnvironmentError):
         )
 
 
+def kill(process, code):
+    process.kill()
+    process.returncode = code
+
+
+@contextmanager
+def timeout_manager(proc, seconds=0):
+    try:
+        if not seconds:
+            yield proc.communicate()[1]
+            return
+
+        timeout_code = -1
+        timer = Timer(seconds, kill, [proc, timeout_code])
+        timer.start()
+        try:
+            _, error_string = proc.communicate()
+            yield error_string
+        finally:
+            timer.cancel()
+            if proc.returncode is timeout_code and not error_string:
+                raise RuntimeError('Tesseract process timeout')
+    finally:
+        proc.stdin.close()
+        proc.stdout.close()
+        proc.stderr.close()
+
+
 def run_once(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -107,24 +146,15 @@ def cleanup(temp_name):
 
 
 def prepare(image):
-    if isinstance(image, Image.Image):
-        return image
-
     if numpy_installed and isinstance(image, ndarray):
-        return Image.fromarray(image)
+        image = Image.fromarray(image)
 
-    raise TypeError('Unsupported image object')
+    if not isinstance(image, Image.Image):
+        raise TypeError('Unsupported image object')
 
-
-def save_image(image):
-    _, temp_name = tempfile.mkstemp(prefix='tess_')
-    if isinstance(image, str):
-        return temp_name, realpath(normpath(normcase(image)))
-
-    image = prepare(image)
-    img_extension = image.format
-    if image.format not in {'JPEG', 'PNG', 'TIFF', 'BMP', 'GIF'}:
-        img_extension = 'PNG'
+    extension = 'PNG' if not image.format else image.format
+    if extension not in SUPPORTED_FORMATS:
+        raise TypeError('Unsupported image format/type')
 
     if not image.mode.startswith(RGB_MODE):
         image = image.convert(RGB_MODE)
@@ -135,14 +165,28 @@ def save_image(image):
         background.paste(image, (0, 0), image)
         image = background
 
-    input_file_name = temp_name + os.extsep + img_extension
-    image.save(input_file_name, format=img_extension, **image.info)
+    image.format = extension
+    return image, extension
+
+
+def save_image(image):
+    with tempfile.NamedTemporaryFile(prefix='tess_', delete=False) as f:
+        temp_name = f.name
+
+    if isinstance(image, str):
+        return temp_name, realpath(normpath(normcase(image)))
+
+    image, extension = prepare(image)
+    input_file_name = temp_name + os.extsep + extension
+    image.save(input_file_name, format=extension, **image.info)
     return temp_name, input_file_name
 
 
 def subprocess_args(include_stdout=True):
-    # See https://github.com/pyinstaller/pyinstaller/wiki/Recipe-subprocess
-    # for reference and comments.
+    """
+    See https://github.com/pyinstaller/pyinstaller/wiki/Recipe-subprocess
+    for reference and comments.
+    """
 
     kwargs = {
         'stdin': subprocess.PIPE,
@@ -167,7 +211,8 @@ def run_tesseract(input_filename,
                   extension,
                   lang,
                   config='',
-                  nice=0):
+                  nice=0,
+                  timeout=0):
     cmd_args = []
 
     if not sys.platform.startswith('win32') and nice != 0:
@@ -178,9 +223,10 @@ def run_tesseract(input_filename,
     if lang is not None:
         cmd_args += ('-l', lang)
 
-    cmd_args += shlex.split(config)
+    if config:
+        cmd_args += shlex.split(config)
 
-    if extension not in {'box', 'osd', 'tsv'}:
+    if extension and extension not in {'box', 'osd', 'tsv'}:
         cmd_args.append(extension)
 
     try:
@@ -188,22 +234,17 @@ def run_tesseract(input_filename,
     except OSError:
         raise TesseractNotFoundError()
 
-    try:
-        _, error_string = proc.communicate()
-    finally:
-        proc.stdin.close()
-        proc.stdout.close()
-        proc.stderr.close()
-
-    if proc.returncode:
-        raise TesseractError(proc.returncode, get_errors(error_string))
+    with timeout_manager(proc, timeout) as error_string:
+        if proc.returncode:
+            raise TesseractError(proc.returncode, get_errors(error_string))
 
 
 def run_and_get_output(image,
-                       extension,
+                       extension='',
                        lang=None,
                        config='',
                        nice=0,
+                       timeout=0,
                        return_bytes=False):
 
     temp_name, input_filename = '', ''
@@ -215,7 +256,8 @@ def run_and_get_output(image,
             'extension': extension,
             'lang': lang,
             'config': config,
-            'nice': nice
+            'nice': nice,
+            'timeout': timeout
         }
 
         run_tesseract(**kwargs)
@@ -318,11 +360,12 @@ def image_to_string(image,
                     lang=None,
                     config='',
                     nice=0,
-                    output_type=Output.STRING):
+                    output_type=Output.STRING,
+                    timeout=0):
     """
     Returns the result of a Tesseract OCR run on the provided image to string
     """
-    args = [image, 'txt', lang, config, nice]
+    args = [image, 'txt', lang, config, nice, timeout]
 
     return {
         Output.BYTES: lambda: run_and_get_output(*(args + [True])),
@@ -335,14 +378,15 @@ def image_to_pdf_or_hocr(image,
                          lang=None,
                          config='',
                          nice=0,
-                         extension='pdf'):
+                         extension='pdf',
+                         timeout=0):
     """
     Returns the result of a Tesseract OCR run on the provided image to pdf/hocr
     """
 
     if extension not in {'pdf', 'hocr'}:
         raise ValueError('Unsupported extension: {}'.format(extension))
-    args = [image, extension, lang, config, nice, True]
+    args = [image, extension, lang, config, nice, timeout, True]
 
     return run_and_get_output(*args)
 
@@ -351,12 +395,13 @@ def image_to_boxes(image,
                    lang=None,
                    config='',
                    nice=0,
-                   output_type=Output.STRING):
+                   output_type=Output.STRING,
+                   timeout=0):
     """
     Returns string containing recognized characters and their box boundaries
     """
     config += ' batch.nochop makebox'
-    args = [image, 'box', lang, config, nice]
+    args = [image, 'box', lang, config, nice, timeout]
 
     return {
         Output.BYTES: lambda: run_and_get_output(*(args + [True])),
@@ -385,7 +430,8 @@ def image_to_data(image,
                   lang=None,
                   config='',
                   nice=0,
-                  output_type=Output.STRING):
+                  output_type=Output.STRING,
+                  timeout=0):
     """
     Returns string containing box boundaries, confidences,
     and other information. Requires Tesseract 3.05+
@@ -395,7 +441,7 @@ def image_to_data(image,
         raise TSVNotSupported()
 
     config = '{} {}'.format('-c tessedit_create_tsv=1', config.strip()).strip()
-    args = [image, 'tsv', lang, config, nice]
+    args = [image, 'tsv', lang, config, nice, timeout]
 
     return {
         Output.BYTES: lambda: run_and_get_output(*(args + [True])),
@@ -409,7 +455,8 @@ def image_to_osd(image,
                  lang='osd',
                  config='',
                  nice=0,
-                 output_type=Output.STRING):
+                 output_type=Output.STRING,
+                 timeout=0):
     """
     Returns string containing the orientation and script detection (OSD)
     """
@@ -417,7 +464,7 @@ def image_to_osd(image,
         '' if get_tesseract_version() < '3.05' else '-',
         config.strip()
     ).strip()
-    args = [image, 'osd', lang, config, nice]
+    args = [image, 'osd', lang, config, nice, timeout]
 
     return {
         Output.BYTES: lambda: run_and_get_output(*(args + [True])),
